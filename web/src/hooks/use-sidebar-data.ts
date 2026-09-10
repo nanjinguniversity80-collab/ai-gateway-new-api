@@ -23,6 +23,7 @@ import {
   CreditCard,
   FileText,
   FlaskConical,
+  Gauge,
   Key,
   LayoutDashboard,
   ListTodo,
@@ -132,6 +133,11 @@ export function useSidebarData(): SidebarData {
         id: 'admin',
         title: t('Admin'),
         items: [
+          {
+            title: t('Gateway management'),
+            url: '/gateway-admin',
+            icon: Gauge,
+          },
           {
             title: t('Channels'),
             url: '/channels',

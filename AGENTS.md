@@ -2,6 +2,13 @@
 
 DO NOT send optional commentary
 
+## Personal Fork Delivery
+
+- This fork is the long-lived source for the personal `ai-gateway` management UI. Keep personal extensions as reviewed source changes; do not patch files inside a running container.
+- Preserve the native administrator route `/gateway-admin/`, the administrator-only policy API contract under `/audit/api/policies`, and the public API-Key usage route `/token-usage/` when syncing upstream releases.
+- Deployment, packaging, release builds, and publication are blocked until every participating source/configuration/script change is committed and pushed. The deployment repository must pin the exact pushed commit used for the image build.
+- Do not commit API keys, access tokens, passwords, cookies, OAuth credentials, or generated runtime data.
+
 ## Overview
 
 This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI providers (OpenAI, Claude, Gemini, Azure, AWS Bedrock, etc.) behind a unified API, with user management, billing, rate limiting, and an admin dashboard.
