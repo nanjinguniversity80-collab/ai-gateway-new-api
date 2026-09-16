@@ -551,6 +551,61 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	}
 }
 
+func TestAddAndUpdateTokenSynchronizeAuditName(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	type registration struct {
+		Name string `json:"name"`
+		Key  string `json:"key"`
+	}
+	registrations := make(chan registration, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "sync-secret", r.Header.Get("X-Audit-Token-Sync"))
+		var payload registration
+		require.NoError(t, common.DecodeJson(r.Body, &payload))
+		registrations <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Setenv("AUDIT_TOKEN_SYNC_URL", server.URL)
+	t.Setenv("AUDIT_TOKEN_SYNC_SECRET", "sync-secret")
+
+	createBody := map[string]any{
+		"name":                 "created-name",
+		"expired_time":         -1,
+		"unlimited_quota":      true,
+		"model_limits_enabled": false,
+		"group":                "default",
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", createBody, 1)
+	AddToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	createdRegistration := <-registrations
+	assert.Equal(t, "created-name", createdRegistration.Name)
+	assert.True(t, strings.HasPrefix(createdRegistration.Key, "sk-"))
+
+	var token model.Token
+	require.NoError(t, db.First(&token, "name = ?", "created-name").Error)
+	updateBody := map[string]any{
+		"id":                   token.Id,
+		"name":                 "renamed-token",
+		"expired_time":         -1,
+		"unlimited_quota":      true,
+		"model_limits_enabled": false,
+		"group":                "default",
+	}
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", updateBody, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	renamedRegistration := <-registrations
+	assert.Equal(t, "renamed-token", renamedRegistration.Name)
+	assert.Equal(t, createdRegistration.Key, renamedRegistration.Key)
+
+	require.NoError(t, service.SyncAllAuditTokenNames())
+	reconciledRegistration := <-registrations
+	assert.Equal(t, "renamed-token", reconciledRegistration.Name)
+	assert.Equal(t, createdRegistration.Key, reconciledRegistration.Key)
+}
+
 func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "owned-token", "owner1234token5678")

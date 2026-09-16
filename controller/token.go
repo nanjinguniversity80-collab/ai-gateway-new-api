@@ -350,6 +350,9 @@ func AddToken(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if err := service.SyncAuditTokenName(cleanToken.Name, cleanToken.GetFullKey()); err != nil {
+		common.SysError(fmt.Sprintf("failed to synchronize audit name for token %d: %v", cleanToken.Id, err))
+	}
 	params["id"] = cleanToken.Id
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	c.JSON(http.StatusOK, gin.H{
@@ -452,6 +455,9 @@ func UpdateToken(c *gin.Context) {
 	if err != nil {
 		common.ApiError(c, err)
 		return
+	}
+	if err := service.SyncAuditTokenName(cleanToken.Name, cleanToken.GetFullKey()); err != nil {
+		common.SysError(fmt.Sprintf("failed to synchronize audit name for token %d: %v", cleanToken.Id, err))
 	}
 	params["name"] = cleanToken.Name
 	if statusOnly != "" {
