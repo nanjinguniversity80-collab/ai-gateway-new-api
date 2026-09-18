@@ -113,6 +113,17 @@ export function UserAuthForm({
   )
   const hasAlternativeLogin =
     passkeyLoginEnabled || hasWeChatLogin || hasOAuthLogin
+  const unifiedOIDCOnly = Boolean(
+    !passwordLoginEnabled &&
+      !passkeyLoginEnabled &&
+      !hasWeChatLogin &&
+      status?.oidc_enabled &&
+      !status?.github_oauth &&
+      !status?.discord_oauth &&
+      !status?.linuxdo_oauth &&
+      !status?.telegram_oauth &&
+      (status?.custom_oauth_providers?.length ?? 0) === 0
+  )
 
   useEffect(() => {
     if (requiresLegalConsent) {
@@ -329,6 +340,7 @@ export function UserAuthForm({
       <OAuthProviders
         status={status}
         redirectTo={redirectTo}
+        autoStartOIDC={unifiedOIDCOnly}
         disabled={isLoading || (requiresLegalConsent && !agreedToLegal)}
         onWeChatLogin={hasWeChatLogin ? handleOpenWeChatDialog : undefined}
         isWeChatLoading={isWeChatSubmitting}
