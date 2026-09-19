@@ -26,6 +26,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { logout } from '@/features/auth/api'
 import { clearAuthenticatedClientState } from '@/lib/auth-session'
 import { handleServerError } from '@/lib/handle-server-error'
+import { submitMatrixLogout } from '@/lib/matrix-navigation'
 
 interface SignOutDialogProps {
   open: boolean
@@ -41,6 +42,7 @@ export function SignOutDialog({ open, onOpenChange }: SignOutDialogProps) {
   const handleSignOut = async () => {
     setIsSigningOut(true)
     try {
+      if (submitMatrixLogout(document, window.location.origin)) return
       const response = await logout()
       if (!response.success) {
         handleServerError(response, t('Failed to sign out session'))
