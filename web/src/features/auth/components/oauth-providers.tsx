@@ -30,6 +30,10 @@ import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
 import { useOAuthLogin } from '../hooks/use-oauth-login'
+import {
+  claimOIDCAutoLogin,
+  getOAuthSessionStorage,
+} from '../lib/oauth-callback-mode'
 import type { SystemStatus } from '../types'
 
 type OAuthProvidersProps = {
@@ -74,12 +78,14 @@ export function OAuthProviders({
   const oidcStartedRef = useRef(false)
 
   useEffect(() => {
-    if (!autoStartOIDC || oidcStartedRef.current) return
+    if (!autoStartOIDC || disabled || oidcStartedRef.current) return
     if (!status?.oidc_authorization_endpoint || !status?.oidc_client_id) return
+    if (!claimOIDCAutoLogin(getOAuthSessionStorage(window))) return
     oidcStartedRef.current = true
     void handleOIDCLogin()
   }, [
     autoStartOIDC,
+    disabled,
     handleOIDCLogin,
     status?.oidc_authorization_endpoint,
     status?.oidc_client_id,

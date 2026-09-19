@@ -20,6 +20,8 @@ import { describe, expect, test } from 'vitest'
 
 import {
   getOAuthSessionStorage,
+  claimOIDCAutoLogin,
+  resetOIDCAutoLogin,
   markOAuthPopup,
   resolveOAuthCallbackMode,
   type OAuthModeStorage,
@@ -35,6 +37,32 @@ function fakeStorage(initial: Record<string, string> = {}): OAuthModeStorage {
 
 const openOpener = { closed: false }
 const bindState = 'bind-state'
+
+describe('OIDC automatic login across page navigation', () => {
+  test('a failed attempt cannot start again after returning to sign-in', () => {
+    const storage = fakeStorage()
+    expect(claimOIDCAutoLogin(storage)).toBe(true)
+    expect(claimOIDCAutoLogin(storage)).toBe(false)
+  })
+
+  test('successful login allows a future automatic login after session expiry', () => {
+    const storage = fakeStorage()
+    expect(claimOIDCAutoLogin(storage)).toBe(true)
+    resetOIDCAutoLogin(storage)
+    expect(claimOIDCAutoLogin(storage)).toBe(true)
+  })
+
+  test('unavailable storage falls back to manual login rather than a redirect loop', () => {
+    expect(claimOIDCAutoLogin(null)).toBe(false)
+    const denied = {
+      getItem: () => {
+        throw new Error('disabled')
+      },
+      setItem: () => {},
+    }
+    expect(claimOIDCAutoLogin(denied)).toBe(false)
+  })
+})
 
 describe('resolveOAuthCallbackMode', () => {
   test('matching provider and state mark is treated as a bind flow', () => {

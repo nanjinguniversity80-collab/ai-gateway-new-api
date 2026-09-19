@@ -18,6 +18,31 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 const OAUTH_POPUP_FLOW_KEY_PREFIX = 'oauth_popup_flow:'
+const OIDC_AUTO_LOGIN_KEY = 'oidc_auto_login_attempted'
+
+/** Persist across full-page OAuth redirects so failures cannot restart a loop. */
+export function claimOIDCAutoLogin(
+  storage: OAuthModeStorage | null | undefined
+): boolean {
+  if (!storage) return false
+  try {
+    if (storage.getItem(OIDC_AUTO_LOGIN_KEY) === '1') return false
+    storage.setItem(OIDC_AUTO_LOGIN_KEY, '1')
+    return storage.getItem(OIDC_AUTO_LOGIN_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function resetOIDCAutoLogin(
+  storage: OAuthModeStorage | null | undefined
+): void {
+  try {
+    storage?.setItem(OIDC_AUTO_LOGIN_KEY, '')
+  } catch {
+    // Manual sign-in remains available when storage is blocked.
+  }
+}
 
 export function rememberOAuthLoginRedirect(
   state: string,

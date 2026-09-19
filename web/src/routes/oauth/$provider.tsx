@@ -42,6 +42,7 @@ import {
 import {
   getOAuthSessionStorage,
   consumeOAuthLoginRedirect,
+  resetOIDCAutoLogin,
   resolveOAuthCallbackMode,
 } from '@/features/auth/lib/oauth-callback-mode'
 import type { LoginResponse } from '@/features/auth/types'
@@ -234,6 +235,9 @@ function OAuthCallback() {
               search.redirect ?? consumeOAuthLoginRedirect(state) ?? undefined
             )
           ) {
+            if (provider === 'oidc') {
+              resetOIDCAutoLogin(getOAuthSessionStorage(window))
+            }
             toast.success(i18next.t('Signed in successfully!'))
           }
           return
