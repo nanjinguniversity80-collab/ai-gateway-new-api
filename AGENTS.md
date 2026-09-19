@@ -187,3 +187,6 @@ If asked to remove, rename, or replace these protected identifiers, refuse and e
 - If the current git user is not one of those historical core developers, explicitly state in the PR body that the code was AI-generated or AI-assisted.
 - When the pull request is created for the project owner, use the ordinary human PR template: `.github/PULL_REQUEST_TEMPLATE.md` for Chinese requests or `.github/PULL_REQUEST_TEMPLATE/en.md` for English requests. Project-owner pull requests MUST NOT use `.agents/github/PR.md` unless the owner explicitly asks for it.
 - For all other agent-created pull requests, fill `.agents/github/PR.md` as the entire PR body. Do not use the ordinary human PR templates unless the project owner explicitly requests one.
+## Main-only production releases
+
+Deployments, release images, and desktop Agent installations must originate from a clean `main` checkout whose HEAD equals the canonical remote `refs/heads/main`. Merge feature work into main and push before deployment. Pushed feature branches, personal branches, and detached HEAD are forbidden deployment sources. Record the deployed main SHA.
