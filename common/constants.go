@@ -160,6 +160,12 @@ var SyncFrequency int // unit is second
 var BatchUpdateEnabled = false
 var BatchUpdateInterval int
 
+// UnmeteredQuotaEnabled removes the synthetic user-wallet ceiling while
+// preserving request accounting and optional per-token quota enforcement.
+// It is intended for private gateways backed by an operator-managed upstream
+// account pool rather than prepaid API billing.
+var UnmeteredQuotaEnabled = false
+
 var RelayTimeout int // unit is second
 
 var RelayIdleConnTimeout int // unit is second

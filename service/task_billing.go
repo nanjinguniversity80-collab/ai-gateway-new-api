@@ -103,6 +103,9 @@ func taskIsSubscription(task *model.Task) bool {
 
 // taskAdjustFunding 调整任务的资金来源（钱包或订阅），delta > 0 表示扣费，delta < 0 表示退还。
 func taskAdjustFunding(task *model.Task, delta int) error {
+	if task.PrivateData.BillingSource == BillingSourceUnmetered {
+		return nil
+	}
 	if taskIsSubscription(task) {
 		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
 	}
@@ -118,11 +121,15 @@ func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
 	if task.PrivateData.TokenId <= 0 || delta == 0 {
 		return
 	}
-	tokenKey := resolveTokenKey(ctx, task.PrivateData.TokenId, task.TaskID)
-	if tokenKey == "" {
+	token, err := model.GetTokenById(task.PrivateData.TokenId)
+	if err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("获取令牌失败 (tokenId=%d, task=%s): %s", task.PrivateData.TokenId, task.TaskID, err.Error()))
 		return
 	}
-	var err error
+	if token.UnlimitedQuota {
+		return
+	}
+	tokenKey := token.Key
 	if delta > 0 {
 		err = model.DecreaseTokenQuota(task.PrivateData.TokenId, tokenKey, delta)
 	} else {
