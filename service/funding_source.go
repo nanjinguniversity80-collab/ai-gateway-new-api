@@ -23,6 +23,17 @@ type FundingSource interface {
 	Refund() error
 }
 
+// UnmeteredFunding keeps synthetic quota calculation and usage logs intact but
+// never treats the user's wallet balance as an authorization ceiling.
+// Per-token quota, expiry, revocation, model policy, and rate limits remain
+// independent and continue to be enforced by their existing paths.
+type UnmeteredFunding struct{}
+
+func (u *UnmeteredFunding) Source() string       { return BillingSourceUnmetered }
+func (u *UnmeteredFunding) PreConsume(int) error { return nil }
+func (u *UnmeteredFunding) Settle(int) error     { return nil }
+func (u *UnmeteredFunding) Refund() error        { return nil }
+
 // ---------------------------------------------------------------------------
 // WalletFunding — 钱包资金来源实现
 // ---------------------------------------------------------------------------
