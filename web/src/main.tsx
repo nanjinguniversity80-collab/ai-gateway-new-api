@@ -21,6 +21,7 @@ import { RouterProvider, createRouter } from '@tanstack/react-router'
 import { StrictMode } from 'react'
 import ReactDOM from 'react-dom/client'
 
+import { LocaleBoundary } from '@/i18n/locale-boundary'
 import { installBuildMetadata } from '@/lib/build-metadata'
 import { applyFaviconToDom } from '@/lib/dom-utils'
 import '@/lib/dayjs'
@@ -108,7 +109,9 @@ if (!rootElement.innerHTML) {
         <ThemeProvider>
           <FontProvider>
             <DirectionProvider>
-              <RouterProvider router={router} />
+              <LocaleBoundary>
+                <RouterProvider router={router} />
+              </LocaleBoundary>
             </DirectionProvider>
           </FontProvider>
         </ThemeProvider>
