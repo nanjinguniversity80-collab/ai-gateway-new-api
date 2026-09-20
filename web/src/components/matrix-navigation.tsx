@@ -32,7 +32,7 @@ export function MatrixNavigation() {
       className='flex shrink-0 flex-wrap items-center justify-end gap-2 px-3 py-1'
     >
       <Button variant='ghost' size='sm' render={<a href={MATRIX_ADMIN_URL} />}>
-        {t('Return to Matrix management')}
+        {t('Return to Metis management')}
       </Button>
       <Button variant='outline' size='sm' render={<a href='/matrix/logout' />}>
         {t('Sign out')}
