@@ -27,7 +27,10 @@ export function MatrixNavigation() {
   if (!isMatrixGateway(window.location.origin)) return null
 
   return (
-    <nav aria-label={t('Matrix account')} className='flex shrink-0 flex-wrap items-center justify-end gap-2 px-3 py-1'>
+    <nav
+      aria-label={t('Metis account')}
+      className='flex shrink-0 flex-wrap items-center justify-end gap-2 px-3 py-1'
+    >
       <Button variant='ghost' size='sm' render={<a href={MATRIX_ADMIN_URL} />}>
         {t('Return to Matrix management')}
       </Button>
