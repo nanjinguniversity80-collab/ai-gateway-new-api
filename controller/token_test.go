@@ -951,7 +951,11 @@ func verifyAPITokenAudit(t *testing.T) {
 func TestGetTokenUsageDailyHistoryIsKeyScoped(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.Log{}))
-	require.NoError(t, model.InitTokenDailyUsage(time.Now()))
+	t.Setenv("LOG_SQL_DSN", "")
+	oldMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = oldMaster })
+	require.NoError(t, model.InitLogDB())
 	previous := common.LogConsumeEnabled
 	common.LogConsumeEnabled = true
 	t.Cleanup(func() { common.LogConsumeEnabled = previous })
