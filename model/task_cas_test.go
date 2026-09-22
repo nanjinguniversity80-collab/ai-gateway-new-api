@@ -46,7 +46,7 @@ func TestMain(m *testing.M) {
 		&PasskeyCredential{},
 		&TwoFA{},
 		&TwoFABackupCode{},
-		&Log{},
+		&Log{}, &TokenDailyUsage{},
 		&Channel{},
 		&QuotaData{},
 		&Ability{},

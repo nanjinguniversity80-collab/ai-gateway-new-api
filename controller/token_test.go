@@ -947,3 +947,42 @@ func verifyAPITokenAudit(t *testing.T) {
 		assert.EqualValues(t, 1, count)
 	})
 }
+
+func TestGetTokenUsageDailyHistoryIsKeyScoped(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	require.NoError(t, model.InitTokenDailyUsage(time.Now()))
+	previous := common.LogConsumeEnabled
+	common.LogConsumeEnabled = true
+	t.Cleanup(func() { common.LogConsumeEnabled = previous })
+	token := model.Token{UserId: 1, Key: "daily-usage-test-only", Name: "daily", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	require.NoError(t, db.Create(&token).Error)
+	date := time.Now().In(time.FixedZone("Asia/Shanghai", 28800)).Format("2006-01-02")
+	require.NoError(t, db.Create(&model.TokenDailyUsage{TokenID: token.Id, Day: date, Quota: 42}).Error)
+	require.NoError(t, db.Create(&model.TokenDailyUsage{TokenID: token.Id + 1, Day: date, Quota: 999}).Error)
+	for _, header := range []string{"", "Bearer sk-invalid", "Bearer sk-daily-usage-test-only"} {
+		response := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(response)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/usage/token/", nil)
+		ctx.Request.Header.Set("Authorization", header)
+		GetTokenUsage(ctx)
+		if header != "Bearer sk-daily-usage-test-only" {
+			assert.NotContains(t, response.Body.String(), "daily_usage")
+			continue
+		}
+		assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+		var payload struct {
+			Code bool `json:"code"`
+			Data struct {
+				Days      []model.TokenUsageDay `json:"daily_usage"`
+				Available bool                  `json:"daily_usage_available"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+		require.True(t, payload.Code)
+		require.True(t, payload.Data.Available)
+		require.Len(t, payload.Data.Days, 30)
+		assert.Equal(t, int64(42), payload.Data.Days[29].Quota)
+		assert.NotContains(t, response.Body.String(), token.Key)
+	}
+}

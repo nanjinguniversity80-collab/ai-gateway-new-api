@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -253,6 +254,11 @@ func GetTokenUsage(c *gin.Context) {
 		return
 	}
 
+	daily, dailyErr := model.GetTokenDailyUsage(token.Id, time.Now())
+	if dailyErr != nil {
+		common.SysError("daily token usage query failed: " + dailyErr.Error())
+	}
+	c.Header("Cache-Control", "no-store")
 	expiredAt := token.ExpiredTime
 	if expiredAt == -1 {
 		expiredAt = 0
@@ -262,15 +268,18 @@ func GetTokenUsage(c *gin.Context) {
 		"code":    true,
 		"message": "ok",
 		"data": gin.H{
-			"object":               "token_usage",
-			"name":                 token.Name,
-			"total_granted":        token.RemainQuota + token.UsedQuota,
-			"total_used":           token.UsedQuota,
-			"total_available":      token.RemainQuota,
-			"unlimited_quota":      token.UnlimitedQuota,
-			"model_limits":         token.GetModelLimitsMap(),
-			"model_limits_enabled": token.ModelLimitsEnabled,
-			"expires_at":           expiredAt,
+			"object":                "token_usage",
+			"daily_usage":           daily,
+			"daily_usage_available": dailyErr == nil,
+			"usage_timezone":        "Asia/Shanghai",
+			"name":                  token.Name,
+			"total_granted":         token.RemainQuota + token.UsedQuota,
+			"total_used":            token.UsedQuota,
+			"total_available":       token.RemainQuota,
+			"unlimited_quota":       token.UnlimitedQuota,
+			"model_limits":          token.GetModelLimitsMap(),
+			"model_limits_enabled":  token.ModelLimitsEnabled,
+			"expires_at":            expiredAt,
 		},
 	})
 }

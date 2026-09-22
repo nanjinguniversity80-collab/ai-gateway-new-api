@@ -100,7 +100,15 @@ func ensureLogRequestId(log *Log) {
 
 func createLog(log *Log) error {
 	ensureLogRequestId(log)
-	return LOG_DB.Create(log).Error
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) || log.TokenId <= 0 || (log.Type != LogTypeConsume && log.Type != LogTypeRefund) {
+		return LOG_DB.Create(log).Error
+	}
+	return LOG_DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(log).Error; err != nil {
+			return err
+		}
+		return recordTokenDailyUsage(tx, log)
+	})
 }
 
 func clickHouseLogOrder(prefix string) string {
@@ -338,6 +346,7 @@ type RecordConsumeLogParams struct {
 
 func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) {
 	if !common.LogConsumeEnabled {
+		markTokenDailyUsageIncomplete(params.TokenId)
 		return
 	}
 	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
@@ -414,6 +423,7 @@ type RecordTaskBillingLogParams struct {
 
 func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
+		markTokenDailyUsageIncomplete(params.TokenId)
 		return
 	}
 	username, _ := GetUsernameById(params.UserId, false)
