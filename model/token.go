@@ -1,6 +1,7 @@
 package model
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,24 +13,54 @@ import (
 )
 
 type Token struct {
-	Id                 int            `json:"id"`
-	UserId             int            `json:"user_id" gorm:"index"`
-	Key                string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
-	Status             int            `json:"status" gorm:"default:1"`
-	Name               string         `json:"name" gorm:"index" `
-	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
-	AccessedTime       int64          `json:"accessed_time" gorm:"bigint"`
-	ExpiredTime        int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
-	RemainQuota        int            `json:"remain_quota" gorm:"default:0"`
-	UnlimitedQuota     bool           `json:"unlimited_quota"`
-	ModelLimitsEnabled bool           `json:"model_limits_enabled"`
-	ModelLimits        string         `json:"model_limits" gorm:"type:text"`
-	AllowIps           *string        `json:"allow_ips" gorm:"default:''"`
-	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group              string         `json:"group" gorm:"default:''"`
-	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
-	AutoGroups         string         `json:"-" gorm:"type:text"`
-	DeletedAt          gorm.DeletedAt `gorm:"index"`
+	Id                  int            `json:"id"`
+	UserId              int            `json:"user_id" gorm:"index"`
+	Key                 string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+	Status              int            `json:"status" gorm:"default:1"`
+	Name                string         `json:"name" gorm:"index" `
+	CreatedTime         int64          `json:"created_time" gorm:"bigint"`
+	AccessedTime        int64          `json:"accessed_time" gorm:"bigint"`
+	ExpiredTime         int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+	RemainQuota         int            `json:"remain_quota" gorm:"default:0"`
+	UnlimitedQuota      bool           `json:"unlimited_quota"`
+	ModelLimitsEnabled  bool           `json:"model_limits_enabled"`
+	ModelLimits         string         `json:"model_limits" gorm:"type:text"`
+	AllowIps            *string        `json:"allow_ips" gorm:"default:''"`
+	UsedQuota           int            `json:"used_quota" gorm:"default:0"` // used quota
+	QuotaLimit          *int           `json:"quota_limit"`
+	QuotaAutoRestore    bool           `json:"auto_restore" gorm:"not null;default:false"`
+	QuotaResetID        string         `json:"quota_reset_id" gorm:"type:varchar(128);not null;default:''"`
+	QuotaCycleStartedAt int64          `json:"quota_cycle_started_at" gorm:"bigint;not null;default:0"`
+	QuotaResetAt        int64          `json:"quota_reset_at" gorm:"bigint;not null;default:0"`
+	Group               string         `json:"group" gorm:"default:''"`
+	CrossGroupRetry     bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	AutoGroups          string         `json:"-" gorm:"type:text"`
+	DeletedAt           gorm.DeletedAt `gorm:"index"`
+}
+
+type TokenQuotaReset struct {
+	ID             string `gorm:"primaryKey;type:varchar(64)"`
+	TokenID        int    `gorm:"index;not null"`
+	Quota          int    `gorm:"not null"`
+	CycleStartedAt int64  `gorm:"bigint;not null"`
+	ResetAt        int64  `gorm:"bigint;not null"`
+	MakeFinite     bool   `gorm:"not null"`
+	AutoRestore    *bool
+}
+
+var ErrQuotaCycleConflict = errors.New("quota cycle conflicts with an existing or newer reset")
+var ErrQuotaResetIDConflict = errors.New("reset_id was already used with different quota cycle values")
+var ErrQuotaCycleStale = errors.New("quota cycle started before the current cycle")
+var ErrQuotaCyclePredecessorRequired = errors.New("same-second quota reset requires previous_reset_id")
+var ErrQuotaCycleUnavailable = errors.New("quota cycle mutation unavailable")
+
+const MaxQuotaCycleTimestamp int64 = 253402300799
+
+func (token *Token) ConfiguredQuotaLimit() int {
+	if token.QuotaLimit != nil {
+		return *token.QuotaLimit
+	}
+	return token.RemainQuota + token.UsedQuota
 }
 
 func (token *Token) GetAutoGroups() ([]string, error) {
@@ -313,7 +344,122 @@ func (token *Token) Update() (err error) {
 		common.SysLog("failed to invalidate token cache before update: " + cacheErr.Error())
 	}
 	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups").Updates(token).Error
+		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups", "quota_limit").Updates(token).Error
+}
+
+func (token *Token) ResetQuota(quota int, resetID string, cycleStartedAt, resetAt int64, makeFinite bool, previousResetID *string, autoRestore *bool) error {
+	if quota < 0 || quota > common.MaxWalletQuota || len(resetID) == 0 || len(resetID) > 128 ||
+		cycleStartedAt <= 0 || cycleStartedAt > common.GetTimestamp() ||
+		resetAt < 0 || resetAt > MaxQuotaCycleTimestamp {
+		return errors.New("invalid quota cycle")
+	}
+	for _, character := range resetID {
+		if character < 33 || character > 126 {
+			return errors.New("invalid reset_id")
+		}
+	}
+	if common.BatchUpdateEnabled {
+		return ErrQuotaCycleUnavailable
+	}
+	reset := TokenQuotaReset{
+		ID:      fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d:%s", token.Id, resetID)))),
+		TokenID: token.Id, Quota: quota, CycleStartedAt: cycleStartedAt, ResetAt: resetAt, MakeFinite: makeFinite, AutoRestore: autoRestore,
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Token
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", token.Id, token.UserId).First(&current).Error; err != nil {
+			return err
+		}
+		*token = current
+		var previous TokenQuotaReset
+		err := tx.Where("id = ?", reset.ID).First(&previous).Error
+		if err == nil {
+			if previous.Quota != quota || previous.CycleStartedAt != cycleStartedAt || previous.ResetAt != resetAt || previous.MakeFinite != makeFinite ||
+				(previous.AutoRestore == nil) != (autoRestore == nil) || (autoRestore != nil && previous.AutoRestore != nil && *autoRestore != *previous.AutoRestore) {
+				return ErrQuotaResetIDConflict
+			}
+			*token = current
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if cycleStartedAt < current.QuotaCycleStartedAt {
+			return ErrQuotaCycleStale
+		}
+		if (previousResetID != nil && *previousResetID != current.QuotaResetID) || (current.UnlimitedQuota && !makeFinite) {
+			return ErrQuotaCycleConflict
+		}
+		if cycleStartedAt == current.QuotaCycleStartedAt && previousResetID == nil {
+			return ErrQuotaCyclePredecessorRequired
+		}
+		if err := invalidateTokenCacheForMutation(current.Key); err != nil {
+			return ErrQuotaCycleUnavailable
+		}
+		current.RemainQuota, current.UsedQuota = quota, 0
+		current.QuotaLimit = &quota
+		current.QuotaResetID, current.QuotaCycleStartedAt, current.QuotaResetAt = resetID, cycleStartedAt, resetAt
+		current.UnlimitedQuota = false
+		if autoRestore != nil {
+			current.QuotaAutoRestore = *autoRestore
+		}
+		if current.Status == common.TokenStatusExhausted && quota > 0 &&
+			(current.ExpiredTime == -1 || current.ExpiredTime > common.GetTimestamp()) {
+			current.Status = common.TokenStatusEnabled
+		}
+		if err := tx.Create(&reset).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&current).Select("remain_quota", "used_quota", "quota_limit", "quota_reset_id",
+			"quota_cycle_started_at", "quota_reset_at", "quota_auto_restore", "unlimited_quota", "status").Updates(&current).Error; err != nil {
+			return err
+		}
+		if err := invalidateTokenCacheForMutation(current.Key); err != nil {
+			return ErrQuotaCycleUnavailable
+		}
+		*token = current
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := invalidateTokenCacheForMutation(token.Key); err != nil {
+		return ErrQuotaCycleUnavailable
+	}
+	return nil
+}
+
+func (token *Token) SyncQuotaCycle(resetAt int64, autoRestore *bool) error {
+	if resetAt < 0 || resetAt > MaxQuotaCycleTimestamp {
+		return errors.New("invalid reset_at")
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Token
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", token.Id, token.UserId).First(&current).Error; err != nil {
+			return err
+		}
+		if err := invalidateTokenCacheForMutation(current.Key); err != nil {
+			return ErrQuotaCycleUnavailable
+		}
+		updates := map[string]any{"quota_reset_at": resetAt}
+		if autoRestore != nil {
+			updates["quota_auto_restore"] = *autoRestore
+			current.QuotaAutoRestore = *autoRestore
+		}
+		if err := tx.Model(&current).Updates(updates).Error; err != nil {
+			return err
+		}
+		current.QuotaResetAt = resetAt
+		*token = current
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := invalidateTokenCacheForMutation(token.Key); err != nil {
+		return ErrQuotaCycleUnavailable
+	}
+	return nil
 }
 
 func (token *Token) SelectUpdate() (err error) {
@@ -395,7 +541,7 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 }
 
 func increaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
+	err = DB.Model(&Token{}).Where("id = ? AND quota_reset_id = ?", id, "").Updates(
 		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota - ?", quota),
@@ -424,7 +570,7 @@ func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 }
 
 func decreaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
+	err = DB.Model(&Token{}).Where("id = ? AND quota_reset_id = ?", id, "").Updates(
 		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", quota),

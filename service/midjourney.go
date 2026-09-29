@@ -86,6 +86,9 @@ func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.M
 	task.TokenId = 0
 	if result.TokenApplied {
 		task.TokenId = relayInfo.TokenId
+		if relayInfo.TokenQuotaResetID != nil {
+			task.TokenQuotaResetID = *relayInfo.TokenQuotaResetID
+		}
 	}
 	if updateErr := task.UpdateBillingState(); updateErr != nil {
 		return true, errors.Join(billingErr, fmt.Errorf("update Midjourney billing state: %w", updateErr))
@@ -110,7 +113,7 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 	if task.TokenId > 0 {
 		tokenKey := resolveTokenKey(ctx, task.TokenId, task.MjId)
 		if tokenKey != "" {
-			if err := model.IncreaseTokenQuota(task.TokenId, tokenKey, quota); err != nil {
+			if _, err := model.AdjustTokenQuotaForCycle(task.TokenId, tokenKey, -quota, task.TokenQuotaResetID); err != nil {
 				logger.LogWarn(ctx, fmt.Sprintf("退还 Midjourney 令牌额度失败 task %s: %s", task.MjId, err.Error()))
 			}
 		}

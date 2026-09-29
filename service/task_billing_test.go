@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -48,6 +49,7 @@ func TestMain(m *testing.M) {
 		&model.Task{},
 		&model.User{},
 		&model.Token{},
+		&model.TokenQuotaReset{},
 		&model.Log{}, &model.TokenDailyUsage{},
 		&model.Channel{},
 		&model.Midjourney{},
@@ -72,6 +74,7 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM tasks")
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
+		model.DB.Exec("DELETE FROM token_quota_resets")
 		model.DB.Exec("DELETE FROM logs")
 		model.DB.Exec("DELETE FROM channels")
 		model.DB.Exec("DELETE FROM midjourneys")
@@ -86,6 +89,231 @@ func seedUser(t *testing.T, id int, quota int) {
 	t.Helper()
 	user := &model.User{Id: id, Username: "test_user", Quota: quota, Status: common.UserStatusEnabled}
 	require.NoError(t, model.DB.Create(user).Error)
+}
+
+func TestBillingSessionQuotaCycleIsolation(t *testing.T) {
+	for _, scenario := range []struct {
+		name          string
+		authUnlimited bool
+		dbUnlimited   bool
+	}{
+		{"unlimited", true, true},
+		{"finite auth to unlimited database", false, true},
+		{"unlimited auth to finite database", true, false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 901, 1000)
+			seedToken(t, 901, 901, "cycle-mode", 100)
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 901).Updates(map[string]any{
+				"unlimited_quota": scenario.dbUnlimited, "quota_reset_id": "mode-cycle",
+			}).Error)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-mode", TokenUnlimited: scenario.authUnlimited, ForcePreConsume: true}
+			session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 901}}
+			require.Nil(t, session.preConsume(ctx, 10))
+			require.NotNil(t, info.TokenQuotaResetID)
+			assert.Equal(t, "mode-cycle", *info.TokenQuotaResetID)
+			assert.Equal(t, scenario.dbUnlimited, info.TokenUnlimited)
+			expectedTokenDebit := 10
+			if scenario.dbUnlimited {
+				expectedTokenDebit = 0
+			}
+			assert.Equal(t, expectedTokenDebit, session.tokenConsumed)
+			assert.Equal(t, 100-expectedTokenDebit, getTokenRemainQuota(t, 901))
+			require.NoError(t, session.Settle(20))
+			assert.Equal(t, 980, getUserQuota(t, 901))
+			assert.Equal(t, 100-2*expectedTokenDebit, getTokenRemainQuota(t, 901))
+			assert.Equal(t, 2*expectedTokenDebit, getTokenUsedQuota(t, 901))
+		})
+	}
+	t.Run("reserve topup uses actual unlimited state", func(t *testing.T) {
+		truncate(t)
+		seedUser(t, 901, 1000)
+		seedToken(t, 901, 901, "cycle-mode-topup", 100)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-mode-topup", ForcePreConsume: true}
+		session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 901}}
+		require.Nil(t, session.preConsume(ctx, 10))
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 901).Update("unlimited_quota", true).Error)
+		require.NoError(t, session.Reserve(20))
+		assert.True(t, info.TokenUnlimited)
+		assert.Equal(t, 10, session.tokenConsumed)
+		assert.Equal(t, 90, getTokenRemainQuota(t, 901))
+		require.NoError(t, session.Settle(30))
+		assert.Equal(t, 970, getUserQuota(t, 901))
+		assert.Equal(t, 90, getTokenRemainQuota(t, 901))
+		assert.Equal(t, 10, getTokenUsedQuota(t, 901))
+	})
+	for _, actual := range []int{0, 2, 20} {
+		t.Run(strconv.Itoa(actual), func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 901, 1000)
+			seedToken(t, 901, 901, "cycle-session", 100)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-session"}
+			session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 901}}
+			require.Nil(t, session.preConsume(ctx, 10))
+			require.NotNil(t, info.TokenQuotaResetID)
+			assert.Empty(t, *info.TokenQuotaResetID)
+			token, err := model.GetTokenById(901)
+			require.NoError(t, err)
+			require.NoError(t, token.ResetQuota(100, "next", 100, 0, false, nil, nil))
+			require.NoError(t, session.Settle(actual))
+			assert.Equal(t, 1000-actual, getUserQuota(t, 901))
+			assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+			assert.Zero(t, getTokenUsedQuota(t, 901))
+		})
+	}
+	t.Run("trusted zero reserve binds cycle", func(t *testing.T) {
+		truncate(t)
+		initial := common.GetTrustQuota() + 100
+		seedUser(t, 901, initial)
+		seedToken(t, 901, 901, "cycle-trusted", initial)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Set("token_quota", initial)
+		info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-trusted", UserQuota: initial}
+		session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 901}}
+		require.Nil(t, session.preConsume(ctx, 10))
+		require.True(t, session.trusted)
+		assert.Zero(t, session.preConsumedQuota)
+		require.NotNil(t, info.TokenQuotaResetID)
+		token, err := model.GetTokenById(901)
+		require.NoError(t, err)
+		require.NoError(t, token.ResetQuota(100, "next", 100, 0, false, nil, nil))
+		require.NoError(t, session.Settle(20))
+		assert.Equal(t, initial-20, getUserQuota(t, 901))
+		assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+		assert.Zero(t, getTokenUsedQuota(t, 901))
+	})
+	t.Run("old reserve topup rolls wallet back without rebinding", func(t *testing.T) {
+		truncate(t)
+		seedUser(t, 901, 1000)
+		seedToken(t, 901, 901, "cycle-reserve", 100)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-reserve"}
+		session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 901}}
+		require.Nil(t, session.preConsume(ctx, 10))
+		token, err := model.GetTokenById(901)
+		require.NoError(t, err)
+		require.NoError(t, token.ResetQuota(100, "next", 100, 0, false, nil, nil))
+		require.Error(t, session.Reserve(20))
+		assert.Equal(t, 990, getUserQuota(t, 901))
+		assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+		assert.Zero(t, getTokenUsedQuota(t, 901))
+	})
+	t.Run("asynchronous cancellation refunds funding only after reset", func(t *testing.T) {
+		truncate(t)
+		seedUser(t, 901, 1000)
+		seedToken(t, 901, 901, "cycle-refund", 100)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-refund"}
+		session := &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 901}}
+		require.Nil(t, session.preConsume(ctx, 10))
+		token, err := model.GetTokenById(901)
+		require.NoError(t, err)
+		require.NoError(t, token.ResetQuota(100, "next", 100, 0, false, nil, nil))
+		queried := make(chan struct{}, 1)
+		require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register("cycle:refund-query", func(tx *gorm.DB) {
+			if tx.Statement.Table == "tokens" {
+				select {
+				case queried <- struct{}{}:
+				default:
+				}
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove("cycle:refund-query")) })
+		session.Refund(ctx)
+		select {
+		case <-queried:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refund did not reach token cycle check")
+		}
+		assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+		assert.Zero(t, getTokenUsedQuota(t, 901))
+		assert.Equal(t, 1000, getUserQuota(t, 901))
+	})
+}
+
+func TestDirectAndTaskQuotaCycleIsolation(t *testing.T) {
+	for _, delta := range []int{-10, 20} {
+		t.Run("direct-"+strconv.Itoa(delta), func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 901, 1000)
+			seedToken(t, 901, 901, "cycle-direct", 100)
+			oldCycle := ""
+			info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-direct", TokenQuotaResetID: &oldCycle}
+			token, err := model.GetTokenById(901)
+			require.NoError(t, err)
+			require.NoError(t, token.ResetQuota(100, "next", 100, 0, false, nil, nil))
+			require.NoError(t, PostConsumeQuota(info, delta, 10, false))
+			assert.Equal(t, 1000-delta, getUserQuota(t, 901))
+			assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+			assert.Zero(t, getTokenUsedQuota(t, 901))
+		})
+	}
+	t.Run("persisted task refunds funding and records history but not new quota", func(t *testing.T) {
+		truncate(t)
+		seedUser(t, 901, 990)
+		seedToken(t, 901, 901, "cycle-task", 90)
+		seedChannel(t, 901)
+		seedChargedAccounting(t, 901, 901, 901, 10, 1)
+		token, err := model.GetTokenById(901)
+		require.NoError(t, err)
+		task := makeTask(901, 901, 10, 901, BillingSourceWallet, 0)
+		task.PrivateData.TokenQuotaResetID = ""
+		require.NoError(t, model.DB.Create(task).Error)
+		require.NoError(t, token.ResetQuota(100, "next", 100, 0, false, nil, nil))
+		var restored model.Task
+		require.NoError(t, model.DB.First(&restored, task.ID).Error)
+		require.True(t, RefundTaskQuota(context.Background(), &restored, "old task failed"))
+		assert.Equal(t, 1000, getUserQuota(t, 901))
+		assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+		assert.Zero(t, getTokenUsedQuota(t, 901))
+		var entry model.Log
+		require.NoError(t, model.LOG_DB.Where("token_id = ? AND type = ?", 901, model.LogTypeRefund).First(&entry).Error)
+		assert.Equal(t, 10, entry.Quota)
+		task = makeTask(901, 901, 0, 901, BillingSourceWallet, 0)
+		task.PrivateData.TokenQuotaResetID = "next"
+		require.NoError(t, model.DB.Create(task).Error)
+		var current model.Task
+		require.NoError(t, model.DB.First(&current, task.ID).Error)
+		assert.Equal(t, "next", current.PrivateData.TokenQuotaResetID)
+		RecalculateTaskQuota(context.Background(), &current, 10, "same cycle")
+		assert.Equal(t, 90, getTokenRemainQuota(t, 901))
+		assert.Equal(t, 10, getTokenUsedQuota(t, 901))
+		require.NoError(t, token.ResetQuota(100, "third", 200, 0, false, nil, nil))
+		RecalculateTaskQuota(context.Background(), &current, 20, "old cycle extra charge")
+		assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+		assert.Zero(t, getTokenUsedQuota(t, 901))
+		assert.Equal(t, 980, getUserQuota(t, 901))
+	})
+	t.Run("midjourney persists cycle before asynchronous refund", func(t *testing.T) {
+		truncate(t)
+		seedUser(t, 901, 1000)
+		seedToken(t, 901, 901, "cycle-mj", 100)
+		seedChannel(t, 901)
+		token, err := model.GetTokenById(901)
+		require.NoError(t, err)
+		require.NoError(t, token.ResetQuota(100, "first", 100, 0, false, nil, nil))
+		cycle := "first"
+		info := &relaycommon.RelayInfo{UserId: 901, TokenId: 901, TokenKey: "cycle-mj", TokenQuotaResetID: &cycle}
+		task := &model.Midjourney{UserId: 901, ChannelId: 901, MjId: "cycle-mj-task"}
+		prepared, err := PrepareMidjourneyTaskBilling(info, task, 10, true)
+		require.NoError(t, err)
+		require.NoError(t, model.DB.Create(task).Error)
+		billed, err := SettleMidjourneyTaskBilling(info, task, prepared)
+		require.NoError(t, err)
+		require.True(t, billed)
+		var restored model.Midjourney
+		require.NoError(t, model.DB.First(&restored, task.Id).Error)
+		assert.Equal(t, "first", restored.TokenQuotaResetID)
+		require.NoError(t, token.ResetQuota(100, "next", 200, 0, false, nil, nil))
+		require.True(t, RefundMidjourneyQuota(context.Background(), &restored, "old cycle failed"))
+		assert.Equal(t, 1000, getUserQuota(t, 901))
+		assert.Equal(t, 100, getTokenRemainQuota(t, 901))
+		assert.Zero(t, getTokenUsedQuota(t, 901))
+	})
 }
 
 func seedToken(t *testing.T, id int, userId int, key string, remainQuota int) {

@@ -60,11 +60,11 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	// 2) 调整令牌额度
 	var tokenErr error
 	if !s.relayInfo.IsPlayground && !s.relayInfo.TokenUnlimited {
-		if delta > 0 {
-			tokenErr = model.DecreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta)
-		} else {
-			tokenErr = model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, -delta)
+		cycleID := ""
+		if s.relayInfo.TokenQuotaResetID != nil {
+			cycleID = *s.relayInfo.TokenQuotaResetID
 		}
+		_, tokenErr = model.AdjustTokenQuotaForCycle(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta, cycleID)
 		if tokenErr != nil {
 			// 资金来源已提交，令牌调整失败只能记录日志；标记 settled 防止 Refund 误退资金
 			common.SysLog(fmt.Sprintf("error adjusting token quota after funding settled (userId=%d, tokenId=%d, delta=%d): %s",
@@ -98,6 +98,10 @@ func (s *BillingSession) Refund(c *gin.Context) {
 	// 复制需要的值到闭包中
 	tokenId := s.relayInfo.TokenId
 	tokenKey := s.relayInfo.TokenKey
+	cycleID := ""
+	if s.relayInfo.TokenQuotaResetID != nil {
+		cycleID = *s.relayInfo.TokenQuotaResetID
+	}
 	isPlayground := s.relayInfo.IsPlayground
 	tokenConsumed := s.tokenConsumed
 	extraReserved := s.extraReserved
@@ -116,7 +120,7 @@ func (s *BillingSession) Refund(c *gin.Context) {
 		}
 		// 2) 退还令牌额度
 		if tokenConsumed > 0 && !isPlayground {
-			if err := model.IncreaseTokenQuota(tokenId, tokenKey, tokenConsumed); err != nil {
+			if _, err := model.AdjustTokenQuotaForCycle(tokenId, tokenKey, -tokenConsumed, cycleID); err != nil {
 				common.SysLog("error refunding token quota: " + err.Error())
 			}
 		}
@@ -199,7 +203,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	}
 
 	// ---- 1) 预扣令牌额度 ----
-	if effectiveQuota > 0 {
+	if effectiveQuota > 0 || (!s.relayInfo.IsPlayground && s.relayInfo.TokenId > 0) {
 		if err := PreConsumeTokenQuota(s.relayInfo, effectiveQuota); err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
@@ -212,7 +216,11 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	if err := s.funding.PreConsume(effectiveQuota); err != nil {
 		// 预扣费失败，回滚令牌额度
 		if s.tokenConsumed > 0 && !s.relayInfo.IsPlayground {
-			if rollbackErr := model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, s.tokenConsumed); rollbackErr != nil {
+			cycleID := ""
+			if s.relayInfo.TokenQuotaResetID != nil {
+				cycleID = *s.relayInfo.TokenQuotaResetID
+			}
+			if _, rollbackErr := model.AdjustTokenQuotaForCycle(s.relayInfo.TokenId, s.relayInfo.TokenKey, -s.tokenConsumed, cycleID); rollbackErr != nil {
 				common.SysLog(fmt.Sprintf("error rolling back token quota (userId=%d, tokenId=%d, amount=%d, fundingErr=%s): %s",
 					s.relayInfo.UserId, s.relayInfo.TokenId, s.tokenConsumed, err.Error(), rollbackErr.Error()))
 			}
@@ -292,7 +300,7 @@ func (s *BillingSession) rollbackFundingReserve(delta int) {
 }
 
 func (s *BillingSession) reserveToken(delta int) error {
-	if delta <= 0 || s.relayInfo.IsPlayground || s.relayInfo.TokenUnlimited {
+	if delta <= 0 || s.relayInfo.IsPlayground {
 		return nil
 	}
 	if err := PreConsumeTokenQuota(s.relayInfo, delta); err != nil {

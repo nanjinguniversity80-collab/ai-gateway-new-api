@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -247,7 +249,7 @@ func GetTokenUsage(c *gin.Context) {
 	}
 	tokenKey := parts[1]
 
-	token, err := model.GetTokenByKey(strings.TrimPrefix(tokenKey, "sk-"), false)
+	token, err := model.GetTokenByKey(strings.TrimPrefix(tokenKey, "sk-"), true)
 	if err != nil {
 		common.SysError("failed to get token by key: " + err.Error())
 		common.ApiErrorI18n(c, i18n.MsgTokenGetInfoFailed)
@@ -273,7 +275,11 @@ func GetTokenUsage(c *gin.Context) {
 			"daily_usage_available": dailyErr == nil,
 			"usage_timezone":        "Asia/Shanghai",
 			"name":                  token.Name,
-			"total_granted":         token.RemainQuota + token.UsedQuota,
+			"total_granted":         token.ConfiguredQuotaLimit(),
+			"quota_limit":           token.ConfiguredQuotaLimit(),
+			"cycle_started_at":      token.QuotaCycleStartedAt,
+			"reset_at":              token.QuotaResetAt,
+			"auto_restore":          token.QuotaAutoRestore,
 			"total_used":            token.UsedQuota,
 			"total_available":       token.RemainQuota,
 			"unlimited_quota":       token.UnlimitedQuota,
@@ -346,6 +352,7 @@ func AddToken(c *gin.Context) {
 		AccessedTime:       common.GetTimestamp(),
 		ExpiredTime:        token.ExpiredTime,
 		RemainQuota:        token.RemainQuota,
+		QuotaLimit:         &token.RemainQuota,
 		UnlimitedQuota:     token.UnlimitedQuota,
 		ModelLimitsEnabled: token.ModelLimitsEnabled,
 		ModelLimits:        token.ModelLimits,
@@ -442,6 +449,14 @@ func UpdateToken(c *gin.Context) {
 		cleanToken.Status = token.Status
 	} else {
 		// If you add more fields, please also update token.Update()
+		if !token.UnlimitedQuota && (cleanToken.UsedQuota < 0 || cleanToken.UsedQuota > maxTokenQuota()-token.RemainQuota) {
+			common.ApiErrorI18n(c, i18n.MsgTokenQuotaExceedMax, map[string]any{"Max": maxTokenQuota()})
+			return
+		}
+		if !token.UnlimitedQuota && (cleanToken.QuotaLimit == nil || cleanToken.RemainQuota != token.RemainQuota || cleanToken.UnlimitedQuota) {
+			limit := token.RemainQuota + cleanToken.UsedQuota
+			cleanToken.QuotaLimit = &limit
+		}
 		cleanToken.Name = token.Name
 		cleanToken.ExpiredTime = token.ExpiredTime
 		cleanToken.RemainQuota = token.RemainQuota
@@ -501,6 +516,134 @@ func UpdateToken(c *gin.Context) {
 		"message": "",
 		"data":    buildMaskedTokenResponse(cleanToken),
 	})
+}
+
+func ResetTokenQuota(c *gin.Context) {
+	token := quotaCycleOwnedToken(c)
+	if token == nil {
+		return
+	}
+	var request struct {
+		RemainQuota     *int    `json:"remain_quota"`
+		ResetID         string  `json:"reset_id"`
+		CycleStartedAt  *int64  `json:"cycle_started_at"`
+		ResetAt         *int64  `json:"reset_at"`
+		UnlimitedQuota  *bool   `json:"unlimited_quota"`
+		PreviousResetID *string `json:"previous_reset_id"`
+		AutoRestore     *bool   `json:"auto_restore"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil || request.RemainQuota == nil || request.CycleStartedAt == nil || request.ResetAt == nil ||
+		*request.RemainQuota < 0 || *request.RemainQuota > maxTokenQuota() || request.ResetID == "" || len(request.ResetID) > 128 ||
+		*request.CycleStartedAt <= 0 || *request.CycleStartedAt > common.GetTimestamp() ||
+		*request.ResetAt < 0 || *request.ResetAt > model.MaxQuotaCycleTimestamp ||
+		(request.PreviousResetID != nil && len(*request.PreviousResetID) > 128) ||
+		(request.UnlimitedQuota != nil && *request.UnlimitedQuota) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid quota reset request"})
+		return
+	}
+	for _, character := range request.ResetID {
+		if character < 33 || character > 126 {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid reset_id"})
+			return
+		}
+	}
+	params := tokenAuditParams(c)
+	params["id"], params["name"] = token.Id, token.Name
+	if err := token.ResetQuota(*request.RemainQuota, request.ResetID, *request.CycleStartedAt, *request.ResetAt, request.UnlimitedQuota != nil, request.PreviousResetID, request.AutoRestore); err != nil {
+		quotaCycleError(c, err, token)
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	common.ApiSuccess(c, struct {
+		*tokenResponse
+		AcknowledgedResetID string `json:"acknowledged_reset_id"`
+		Superseded          bool   `json:"superseded"`
+	}{buildMaskedTokenResponse(token), request.ResetID, token.QuotaResetID != request.ResetID})
+}
+
+func quotaCycleOwnedToken(c *gin.Context) *model.Token {
+	c.Header("Cache-Control", "no-store")
+	if c.GetInt("role") != common.RoleRootUser || c.GetInt("id") <= 0 {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "Root authorization required"})
+		return nil
+	}
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid token id"})
+		return nil
+	}
+	token, err := model.GetTokenByIds(id, c.GetInt("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Token not found"})
+		return nil
+	}
+	return token
+}
+
+func quotaCycleError(c *gin.Context, err error, token *model.Token) {
+	status := http.StatusServiceUnavailable
+	code := "QUOTA_CYCLE_UNAVAILABLE"
+	message := "Quota cycle update unavailable; retry the same request"
+	switch {
+	case errors.Is(err, model.ErrQuotaResetIDConflict):
+		status, code = http.StatusConflict, "QUOTA_RESET_ID_CONFLICT"
+		message = "reset_id was already used with different quota cycle values"
+	case errors.Is(err, model.ErrQuotaCycleStale):
+		status, code = http.StatusConflict, "QUOTA_CYCLE_STALE"
+		message = "Reset event predates the current cycle; do not retry this event"
+	case errors.Is(err, model.ErrQuotaCyclePredecessorRequired):
+		status, code = http.StatusConflict, "QUOTA_CYCLE_PREDECESSOR_REQUIRED"
+		message = "Same-second reset requires previous_reset_id matching the current quota_reset_id"
+	case errors.Is(err, model.ErrQuotaCycleConflict):
+		status = http.StatusConflict
+		code = "QUOTA_CYCLE_CONFLICT"
+		message = "previous_reset_id does not match, or unlimited token requires explicit conversion"
+	}
+	response := gin.H{"success": false, "code": code, "message": message}
+	if status == http.StatusConflict {
+		response["data"] = buildMaskedTokenResponse(token)
+	}
+	c.JSON(status, response)
+}
+
+func SyncTokenQuotaCycle(c *gin.Context) {
+	token := quotaCycleOwnedToken(c)
+	if token == nil {
+		return
+	}
+	var request map[string]json.RawMessage
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid quota cycle request"})
+		return
+	}
+	var resetAt *int64
+	rawResetAt, present := request["reset_at"]
+	if !present || common.Unmarshal(rawResetAt, &resetAt) != nil || (resetAt != nil && (*resetAt < 0 || *resetAt > model.MaxQuotaCycleTimestamp)) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "reset_at is required and must be null or a valid timestamp"})
+		return
+	}
+	var autoRestore *bool
+	for name, rawValue := range request {
+		if name == "reset_at" {
+			continue
+		}
+		if name != "auto_restore" || common.Unmarshal(rawValue, &autoRestore) != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Only reset_at and optional boolean auto_restore are accepted"})
+			return
+		}
+	}
+	var timestamp int64
+	if resetAt != nil {
+		timestamp = *resetAt
+	}
+	params := tokenAuditParams(c)
+	params["id"], params["name"] = token.Id, token.Name
+	if err := token.SyncQuotaCycle(timestamp, autoRestore); err != nil {
+		quotaCycleError(c, err, token)
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	common.ApiSuccess(c, buildMaskedTokenResponse(token))
 }
 
 type TokenBatch struct {

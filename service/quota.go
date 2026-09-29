@@ -401,11 +401,11 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if relayInfo.IsPlayground {
+	if relayInfo.IsPlayground || (relayInfo.TokenUnlimited && relayInfo.TokenId <= 0) {
 		return nil
 	}
 	// 原子预扣：检查与扣减在同一操作中完成，并发请求不可能同时通过检查后超扣。
-	reserved, err := model.TryReserveTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, quota, relayInfo.TokenUnlimited)
+	reservation, reserved, err := model.ReserveTokenQuotaCycle(relayInfo.TokenId, relayInfo.TokenKey, quota, relayInfo.TokenQuotaResetID)
 	if err != nil {
 		return err
 	}
@@ -416,6 +416,8 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 		}
 		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(remainQuota), logger.FormatQuota(quota))
 	}
+	relayInfo.TokenQuotaResetID = &reservation.ResetID
+	relayInfo.TokenUnlimited = reservation.Unlimited
 	return nil
 }
 
@@ -457,11 +459,11 @@ func postConsumeQuotaWithResult(relayInfo *relaycommon.RelayInfo, quota int, pre
 	result.FundingApplied = true
 
 	if !relayInfo.IsPlayground && !relayInfo.TokenUnlimited {
-		if quota > 0 {
-			err = model.DecreaseTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, quota)
-		} else {
-			err = model.IncreaseTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, -quota)
+		cycleID := ""
+		if relayInfo.TokenQuotaResetID != nil {
+			cycleID = *relayInfo.TokenQuotaResetID
 		}
+		result.TokenApplied, err = model.AdjustTokenQuotaForCycle(relayInfo.TokenId, relayInfo.TokenKey, quota, cycleID)
 		if err != nil {
 			return result, err
 		}

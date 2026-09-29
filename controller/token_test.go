@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,8 +20,10 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -75,6 +79,555 @@ type legacyToken struct {
 
 func (legacyToken) TableName() string {
 	return "tokens"
+}
+
+func TestQuotaResetReplayAfterSpend(t *testing.T) {
+	db := openTokenControllerTestDB(t)
+	migrateTokenControllerTestDB(t, db)
+	require.NoError(t, db.AutoMigrate(&model.TokenQuotaReset{}))
+	token := &model.Token{UserId: 1, Key: "cycle-replay-secret", RemainQuota: 20, UsedQuota: 80, ExpiredTime: -1}
+	require.NoError(t, db.Create(token).Error)
+	router := gin.New()
+	router.POST("/api/token/:id/reset", func(ctx *gin.Context) {
+		ctx.Set("id", 1)
+		ctx.Set("role", common.RoleRootUser)
+	}, ResetTokenQuota)
+	body := `{"remain_quota":100,"reset_id":"cycle-one","cycle_started_at":100,"reset_at":200}`
+	requestReset := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest("POST", fmt.Sprintf("/api/token/%d/reset", token.Id), strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	require.True(t, decodeAPIResponse(t, requestReset()).Success)
+	_, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, 30, "cycle-one")
+	require.NoError(t, err)
+	require.True(t, decodeAPIResponse(t, requestReset()).Success)
+	require.NoError(t, db.First(token, token.Id).Error)
+	assert.Equal(t, 70, token.RemainQuota)
+	assert.Equal(t, 30, token.UsedQuota)
+}
+
+func TestTokenQuotaCycleDatabases(t *testing.T) {
+	for _, database := range []struct {
+		name, env string
+		typ       common.DatabaseType
+	}{
+		{"sqlite", "", common.DatabaseTypeSQLite},
+		{"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL},
+		{"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL},
+	} {
+		for _, upgrade := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/upgrade=%v", database.name, upgrade), func(t *testing.T) {
+				dsn := os.Getenv(database.env)
+				if database.env != "" && dsn == "" {
+					t.Skip(database.env + " is not configured")
+				}
+				previousDB, previousLog := model.DB, model.LOG_DB
+				previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+				previousRedis, previousBatch := common.RedisEnabled, common.BatchUpdateEnabled
+				previousMaster := common.IsMasterNode
+				t.Cleanup(func() {
+					model.DB, model.LOG_DB = previousDB, previousLog
+					common.SetDatabaseTypes(previousMainType, previousLogType)
+					common.RedisEnabled, common.BatchUpdateEnabled = previousRedis, previousBatch
+					common.IsMasterNode = previousMaster
+				})
+				common.RedisEnabled, common.BatchUpdateEnabled = false, false
+				common.IsMasterNode = true
+				db, _ := newAuditTestDatabase(t, database.name, dsn)
+				model.DB, model.LOG_DB = db, db
+				common.SetDatabaseTypes(database.typ, database.typ)
+				if upgrade {
+					require.NoError(t, db.AutoMigrate(&legacyToken{}))
+					require.NoError(t, db.Create(&legacyToken{UserId: 99, Key: "legacy-cycle-secret", RemainQuota: 70, UsedQuota: 30}).Error)
+					require.NoError(t, db.AutoMigrate(&model.Midjourney{}))
+					require.NoError(t, db.Create(&model.Midjourney{UserId: 99, TokenId: 99, Quota: 10}).Error)
+					require.NoError(t, db.Migrator().DropColumn(&model.Midjourney{}, "token_quota_reset_id"))
+				}
+				for range 2 {
+					require.NoError(t, db.AutoMigrate(&model.Token{}, &model.TokenQuotaReset{}, &model.User{}, &model.UserSession{}, &model.Log{}, &model.Midjourney{}))
+				}
+				t.Setenv("LOG_SQL_DSN", "")
+				require.NoError(t, model.InitLogDB())
+				if upgrade {
+					var legacy model.Token
+					require.NoError(t, db.Where("user_id = ?", 99).First(&legacy).Error)
+					assert.Equal(t, 70, legacy.RemainQuota)
+					assert.Equal(t, 30, legacy.UsedQuota)
+					assert.Nil(t, legacy.QuotaLimit)
+					assert.Zero(t, legacy.QuotaCycleStartedAt)
+					assert.Zero(t, legacy.QuotaResetAt)
+					assert.Equal(t, 100, legacy.ConfiguredQuotaLimit())
+					assert.True(t, db.Migrator().HasIndex(&model.Token{}, "idx_tokens_key"))
+					var legacyTask model.Midjourney
+					require.NoError(t, db.Where("user_id = ?", 99).First(&legacyTask).Error)
+					assert.Equal(t, 10, legacyTask.Quota)
+					assert.Equal(t, 99, legacyTask.TokenId)
+					assert.Empty(t, legacyTask.TokenQuotaResetID)
+				}
+				versionSQL := "SELECT version()"
+				if database.name == "sqlite" {
+					versionSQL = "SELECT sqlite_version()"
+				}
+				var version string
+				require.NoError(t, db.Raw(versionSQL).Scan(&version).Error)
+				t.Logf("database version: %s", version)
+				verifyTokenQuotaCycle(t)
+			})
+		}
+	}
+}
+
+func verifyTokenQuotaCycle(t *testing.T) {
+	t.Helper()
+	rootPAT, userPAT := "cycle-root-pat-secret", "cycle-user-pat-secret"
+	root := &model.User{Username: "cycle-root", Password: "placeholder", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AccessToken: &rootPAT, AffCode: "cycle-root"}
+	user := &model.User{Username: "cycle-user", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AccessToken: &userPAT, AffCode: "cycle-user"}
+	require.NoError(t, model.DB.Create(root).Error)
+	require.NoError(t, model.DB.Create(user).Error)
+	router := gin.New()
+	router.Use(middleware.RequestId())
+	routes := router.Group("/api/token", middleware.UserAuth(), middleware.TokenOperationAudit())
+	routes.POST("/:id/reset", middleware.RootAuth(), middleware.DisableCache(), ResetTokenQuota)
+	routes.POST("/:id/quota-cycle", middleware.RootAuth(), middleware.DisableCache(), SyncTokenQuotaCycle)
+	routes.PUT("/", UpdateToken)
+	router.GET("/api/usage/token/", middleware.DisableCache(), GetTokenUsage)
+	request := func(path, credential, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if credential != "" {
+			req.Header.Set("Authorization", "Bearer "+credential)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+	createToken := func(t *testing.T, status int, expires int64, unlimited bool) *model.Token {
+		t.Helper()
+		token := &model.Token{UserId: root.Id, Name: t.Name(), Key: fmt.Sprintf("%x", sha256.Sum256([]byte(t.Name()))), Status: status, ExpiredTime: expires, RemainQuota: 20, UsedQuota: 80, UnlimitedQuota: unlimited}
+		require.NoError(t, model.DB.Create(token).Error)
+		return token
+	}
+	resetBody := `{"remain_quota":100,"reset_id":"first","cycle_started_at":100,"reset_at":200}`
+	t.Run("unlimited reservation captures cycle without changing counters", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, true)
+		require.NoError(t, model.DB.Model(token).Update("quota_reset_id", "unlimited-cycle").Error)
+		reservation, reserved, err := model.ReserveTokenQuotaCycle(token.Id, token.Key, 100, nil)
+		require.NoError(t, err)
+		require.True(t, reserved)
+		assert.True(t, reservation.Unlimited)
+		assert.Equal(t, "unlimited-cycle", reservation.ResetID)
+		for _, delta := range []int{-100, 100} {
+			applied, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, delta, reservation.ResetID)
+			require.NoError(t, err)
+			assert.False(t, applied)
+		}
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, 20, token.RemainQuota)
+		assert.Equal(t, 80, token.UsedQuota)
+	})
+	t.Run("old cycle refunds and settlements cannot change new balance", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		oldReservation, reserved, err := model.ReserveTokenQuotaCycle(token.Id, token.Key, 10, nil)
+		require.NoError(t, err)
+		require.True(t, reserved)
+		oldCycle := oldReservation.ResetID
+		assert.Empty(t, oldCycle)
+		require.NoError(t, token.ResetQuota(100, "next", 100, 0, false, nil, nil))
+		for _, delta := range []int{-10, 20} {
+			applied, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, delta, oldCycle)
+			require.NoError(t, err)
+			assert.False(t, applied)
+		}
+		require.NoError(t, model.IncreaseTokenQuota(token.Id, token.Key, 10))
+		require.NoError(t, model.DecreaseTokenQuota(token.Id, token.Key, 10))
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, 100, token.RemainQuota)
+		assert.Zero(t, token.UsedQuota)
+		_, reserved, err = model.ReserveTokenQuotaCycle(token.Id, token.Key, 10, &oldCycle)
+		assert.ErrorIs(t, err, model.ErrQuotaCycleStale)
+		assert.False(t, reserved)
+		reservation, reserved, err := model.ReserveTokenQuotaCycle(token.Id, token.Key, 10, nil)
+		require.NoError(t, err)
+		require.True(t, reserved)
+		assert.Equal(t, "next", reservation.ResetID)
+		applied, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, -10, reservation.ResetID)
+		require.NoError(t, err)
+		assert.True(t, applied)
+		applied, err = model.AdjustTokenQuotaForCycle(token.Id, token.Key, -10, "NEXT")
+		require.NoError(t, err)
+		assert.False(t, applied)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, 100, token.RemainQuota)
+		assert.Zero(t, token.UsedQuota)
+	})
+	t.Run("same second CAS and superseded acknowledgement", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		path := fmt.Sprintf("/api/token/%d/reset", token.Id)
+		require.Equal(t, 200, request(path, rootPAT, resetBody).Code)
+		second := strings.Replace(resetBody, `"first"`, `"second"`, 1)
+		response := request(path, rootPAT, second)
+		assert.Equal(t, 409, response.Code)
+		assert.Contains(t, response.Body.String(), "QUOTA_CYCLE_PREDECESSOR_REQUIRED")
+		second = strings.Replace(second, `"reset_at":200`, `"reset_at":200,"previous_reset_id":"first"`, 1)
+		require.Equal(t, 200, request(path, rootPAT, second).Code)
+		_, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, 25, "second")
+		require.NoError(t, err)
+		response = request(path, rootPAT, resetBody)
+		require.Equal(t, 200, response.Code)
+		var result struct {
+			Data struct {
+				Acknowledged string `json:"acknowledged_reset_id"`
+				Current      string `json:"quota_reset_id"`
+				Superseded   bool   `json:"superseded"`
+				Remain       int    `json:"remain_quota"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Equal(t, "first", result.Data.Acknowledged)
+		assert.Equal(t, "second", result.Data.Current)
+		assert.True(t, result.Data.Superseded)
+		assert.Equal(t, 75, result.Data.Remain)
+		response = request(path, rootPAT, strings.Replace(second, `"previous_reset_id":"first"`, `"previous_reset_id":"second"`, 1))
+		require.Equal(t, 200, response.Code)
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Equal(t, "second", result.Data.Acknowledged)
+		assert.False(t, result.Data.Superseded)
+		assert.Equal(t, 75, result.Data.Remain)
+		third := strings.Replace(second, `"reset_id":"second"`, `"reset_id":"third"`, 1)
+		response = request(path, rootPAT, third)
+		assert.Equal(t, 409, response.Code)
+		assert.Contains(t, response.Body.String(), "QUOTA_CYCLE_CONFLICT")
+		assert.NotContains(t, response.Body.String(), "acknowledged_reset_id")
+		third = strings.Replace(third, `"previous_reset_id":"first"`, `"previous_reset_id":"second"`, 1)
+		require.Equal(t, 200, request(path, rootPAT, third).Code)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, "third", token.QuotaResetID)
+		assert.Equal(t, 100, token.RemainQuota)
+		assert.Zero(t, token.UsedQuota)
+	})
+	t.Run("auto restore is explicit and independent from deadline", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		path := fmt.Sprintf("/api/token/%d", token.Id)
+		body := strings.Replace(resetBody, `"reset_at":200`, `"reset_at":0,"auto_restore":true`, 1)
+		require.Equal(t, 200, request(path+"/reset", rootPAT, body).Code)
+		_, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, 25, "first")
+		require.NoError(t, err)
+		require.Equal(t, 200, request(path+"/quota-cycle", rootPAT, `{"reset_at":null}`).Code)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.True(t, token.QuotaAutoRestore)
+		assert.Zero(t, token.QuotaResetAt)
+		usageReq := httptest.NewRequest("GET", "/api/usage/token/", nil)
+		usageReq.Header.Set("Authorization", "Bearer sk-"+token.Key)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, usageReq)
+		assert.Contains(t, response.Body.String(), `"auto_restore":true`)
+		assert.Contains(t, response.Body.String(), `"reset_at":0`)
+		require.Equal(t, 200, request(path+"/quota-cycle", rootPAT, `{"reset_at":0,"auto_restore":false}`).Code)
+		require.Equal(t, 200, request(path+"/reset", rootPAT, body).Code)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.False(t, token.QuotaAutoRestore)
+		assert.Equal(t, 75, token.RemainQuota)
+		assert.Equal(t, 25, token.UsedQuota)
+		changed := strings.Replace(body, `"auto_restore":true`, `"auto_restore":false`, 1)
+		assert.Equal(t, 409, request(path+"/reset", rootPAT, changed).Code)
+		for _, invalid := range []string{`{"reset_at":0,"auto_restore":1}`, `{"reset_at":0,"auto_restore":"yes"}`} {
+			assert.Equal(t, 400, request(path+"/quota-cycle", rootPAT, invalid).Code)
+		}
+	})
+	t.Run("durable replay after spend and newer cycle", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusExhausted, -1, false)
+		path := fmt.Sprintf("/api/token/%d/reset", token.Id)
+		require.NoError(t, model.LOG_DB.Create(&model.Log{TokenId: token.Id, Content: "cumulative-consumption", Quota: 80}).Error)
+		response := request(path, rootPAT, resetBody)
+		require.Equal(t, 200, response.Code, response.Body.String())
+		assert.NotContains(t, response.Body.String(), token.Key)
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		var result model.Token
+		require.NoError(t, common.Unmarshal(decodeAPIResponse(t, response).Data, &result))
+		assert.Equal(t, common.TokenStatusEnabled, result.Status)
+		require.NotNil(t, result.QuotaLimit)
+		assert.Equal(t, 100, *result.QuotaLimit)
+		assert.EqualValues(t, 100, result.QuotaCycleStartedAt)
+		assert.EqualValues(t, 200, result.QuotaResetAt)
+		_, reserved, err := model.ReserveTokenQuotaCycle(token.Id, token.Key, 30, nil)
+		require.NoError(t, err)
+		require.True(t, reserved)
+		require.Equal(t, 200, request(path, rootPAT, resetBody).Code)
+		require.NoError(t, model.DB.First(&result, token.Id).Error)
+		assert.Equal(t, 70, result.RemainQuota)
+		assert.Equal(t, 30, result.UsedQuota)
+		assert.Equal(t, 409, request(path, rootPAT, strings.Replace(resetBody, `"remain_quota":100`, `"remain_quota":200`, 1)).Code)
+		newBody := `{"remain_quota":50,"reset_id":"second","cycle_started_at":200,"reset_at":300}`
+		require.Equal(t, 200, request(path, rootPAT, newBody).Code)
+		_, err = model.AdjustTokenQuotaForCycle(token.Id, token.Key, 10, "second")
+		require.NoError(t, err)
+		require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.TokenQuotaReset{}))
+		require.Equal(t, 200, request(path, rootPAT, resetBody).Code)
+		assert.Equal(t, 409, request(path, rootPAT, strings.Replace(resetBody, `"first"`, `"stale-unseen"`, 1)).Code)
+		assert.Equal(t, 409, request(path, rootPAT, strings.Replace(newBody, `"second"`, `"same-start"`, 1)).Code)
+		require.NoError(t, model.DB.First(&result, token.Id).Error)
+		assert.Equal(t, 40, result.RemainQuota)
+		assert.Equal(t, 10, result.UsedQuota)
+		assert.Equal(t, "second", result.QuotaResetID)
+		_, reserved, err = model.ReserveTokenQuotaCycle(token.Id, token.Key, 41, nil)
+		require.NoError(t, err)
+		assert.False(t, reserved)
+		var log model.Log
+		require.NoError(t, model.LOG_DB.Where("token_id = ?", token.Id).First(&log).Error)
+		assert.Equal(t, 80, log.Quota)
+		assert.Equal(t, "cumulative-consumption", log.Content)
+		var events []model.AuditLog
+		require.NoError(t, model.LOG_DB.Where("request_id = ? AND category = ?", response.Header().Get(common.RequestIdKey), model.AuditCategorySecurity).Find(&events).Error)
+		require.Len(t, events, 1)
+		assert.Equal(t, "token.quota_reset", events[0].Action)
+		assert.True(t, events[0].Success)
+		encoded, err := common.Marshal(events)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), token.Key)
+		assert.NotContains(t, string(encoded), rootPAT)
+	})
+	t.Run("deadline can lag reset event and configured limit stays exact", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		path := fmt.Sprintf("/api/token/%d/reset", token.Id)
+		for index, deadline := range []int64{0, 50, 100} {
+			body := fmt.Sprintf(`{"remain_quota":%d,"reset_id":"deadline-%d","cycle_started_at":%d,"reset_at":%d}`, maxTokenQuota(), index, 100+index, deadline)
+			require.Equal(t, 200, request(path, rootPAT, body).Code)
+		}
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, maxTokenQuota(), token.RemainQuota)
+		assert.Equal(t, maxTokenQuota(), token.ConfiguredQuotaLimit())
+		assert.Zero(t, token.UsedQuota)
+		_, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, 10, "deadline-2")
+		require.NoError(t, err)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, maxTokenQuota(), token.ConfiguredQuotaLimit())
+	})
+	t.Run("legacy usage has no invented cycle and normal edits bound consumed plus remaining", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		usageReq := httptest.NewRequest("GET", "/api/usage/token/", nil)
+		usageReq.Header.Set("Authorization", "Bearer sk-"+token.Key)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, usageReq)
+		var usage struct {
+			Data struct {
+				Limit   int   `json:"quota_limit"`
+				Started int64 `json:"cycle_started_at"`
+				Reset   int64 `json:"reset_at"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &usage))
+		assert.Equal(t, 100, usage.Data.Limit)
+		assert.Zero(t, usage.Data.Started)
+		assert.Zero(t, usage.Data.Reset)
+		body := fmt.Sprintf(`{"id":%d,"name":"limit-edit","remain_quota":%d,"expired_time":-1}`, token.Id, maxTokenQuota())
+		req := httptest.NewRequest("PUT", "/api/token/", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+rootPAT)
+		req.Header.Set("Content-Type", "application/json")
+		response = httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		assert.False(t, decodeAPIResponse(t, response).Success)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, 20, token.RemainQuota)
+		assert.Equal(t, 80, token.UsedQuota)
+	})
+	t.Run("metadata sync grants nothing and usage reports cycle", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		path := fmt.Sprintf("/api/token/%d", token.Id)
+		require.Equal(t, 200, request(path+"/reset", rootPAT, resetBody).Code)
+		_, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, 25, "first")
+		require.NoError(t, err)
+		for _, value := range []string{"300", "null", "0", "400"} {
+			response := request(path+"/quota-cycle", rootPAT, `{"reset_at":`+value+`}`)
+			require.Equal(t, 200, response.Code)
+			assert.NotContains(t, response.Body.String(), token.Key)
+			require.NoError(t, model.DB.First(token, token.Id).Error)
+			assert.Equal(t, 75, token.RemainQuota)
+			assert.Equal(t, 25, token.UsedQuota)
+			assert.Equal(t, 100, token.ConfiguredQuotaLimit())
+			assert.EqualValues(t, 100, token.QuotaCycleStartedAt)
+		}
+		assert.Equal(t, 200, request(path+"/quota-cycle", rootPAT, `{"reset_at":99}`).Code)
+		usageReq := httptest.NewRequest("GET", "/api/usage/token/", nil)
+		usageReq.Header.Set("Authorization", "Bearer sk-"+token.Key)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, usageReq)
+		var usage struct {
+			Data struct {
+				Limit   int   `json:"quota_limit"`
+				Started int64 `json:"cycle_started_at"`
+				Reset   int64 `json:"reset_at"`
+				Granted int   `json:"total_granted"`
+				Used    int   `json:"total_used"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &usage))
+		assert.Equal(t, 100, usage.Data.Limit)
+		assert.Equal(t, 100, usage.Data.Granted)
+		assert.Equal(t, 25, usage.Data.Used)
+		assert.EqualValues(t, 100, usage.Data.Started)
+		assert.EqualValues(t, 99, usage.Data.Reset)
+	})
+	t.Run("root owner and bearer authorization", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		for _, endpoint := range []string{"reset", "quota-cycle"} {
+			path := fmt.Sprintf("/api/token/%d/%s", token.Id, endpoint)
+			assert.Equal(t, 401, request(path, "", resetBody).Code)
+			assert.Equal(t, 403, request(path, userPAT, resetBody).Code)
+			assert.Equal(t, 401, request(path, "sk-"+token.Key, resetBody).Code)
+		}
+		require.NoError(t, model.DB.Model(token).Update("user_id", user.Id).Error)
+		for _, endpoint := range []string{"reset", "quota-cycle"} {
+			response := request(fmt.Sprintf("/api/token/%d/%s", token.Id, endpoint), rootPAT, resetBody)
+			assert.Equal(t, 404, response.Code)
+			assert.NotContains(t, response.Body.String(), token.Key)
+		}
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, 20, token.RemainQuota)
+	})
+	t.Run("reject invalid finite input", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		path := fmt.Sprintf("/api/token/%d/reset", token.Id)
+		for _, body := range []string{
+			`{}`, `null`, `{"remain_quota":0}`, strings.Replace(resetBody, `"remain_quota":100`, `"remain_quota":null`, 1),
+			strings.Replace(resetBody, `"remain_quota":100`, `"remain_quota":-1`, 1),
+			strings.Replace(resetBody, `"remain_quota":100`, fmt.Sprintf(`"remain_quota":%d`, maxTokenQuota()+1), 1),
+			strings.Replace(resetBody, `"remain_quota":100`, `"remain_quota":1.5`, 1),
+			strings.Replace(resetBody, `"remain_quota":100`, `"remain_quota":1e999`, 1),
+			strings.Replace(resetBody, `"remain_quota":100`, `"remain_quota":NaN`, 1),
+			strings.Replace(resetBody, `"first"`, `""`, 1),
+			strings.Replace(resetBody, `"first"`, `"`+strings.Repeat("x", 129)+`"`, 1),
+			strings.Replace(resetBody, `"first"`, `"line\nbreak"`, 1),
+			strings.Replace(resetBody, `"cycle_started_at":100`, `"cycle_started_at":0`, 1),
+			strings.Replace(resetBody, `"cycle_started_at":100`, fmt.Sprintf(`"cycle_started_at":%d`, common.GetTimestamp()+60), 1),
+			strings.Replace(resetBody, `"reset_at":200`, `"reset_at":null`, 1),
+			strings.Replace(resetBody, `"reset_at":200`, `"reset_at":253402300800`, 1),
+			strings.Replace(resetBody, `"reset_at":200`, `"reset_at":200,"unlimited_quota":true`, 1),
+		} {
+			assert.Equal(t, 400, request(path, rootPAT, body).Code, body)
+		}
+		for _, body := range []string{`{}`, `null`, `{"reset_at":-1}`, `{"reset_at":1.5}`, `{"reset_at":1e999}`, `{"reset_at":253402300800}`, `{"reset_at":0,"remain_quota":100}`} {
+			assert.Equal(t, 400, request(fmt.Sprintf("/api/token/%d/quota-cycle", token.Id), rootPAT, body).Code, body)
+		}
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, 20, token.RemainQuota)
+		assert.Equal(t, 80, token.UsedQuota)
+	})
+	t.Run("status preservation and explicit unlimited conversion", func(t *testing.T) {
+		for _, testCase := range []struct {
+			name      string
+			status    int
+			expires   int64
+			unlimited bool
+			quota     int
+			expected  int
+		}{
+			{"disabled", common.TokenStatusDisabled, -1, false, 100, common.TokenStatusDisabled},
+			{"expired", common.TokenStatusExpired, 1, false, 100, common.TokenStatusExpired},
+			{"exhausted expired", common.TokenStatusExhausted, 1, false, 100, common.TokenStatusExhausted},
+			{"zero", common.TokenStatusExhausted, -1, false, 0, common.TokenStatusExhausted},
+			{"unlimited", common.TokenStatusEnabled, -1, true, 100, common.TokenStatusEnabled},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				token := createToken(t, testCase.status, testCase.expires, testCase.unlimited)
+				path := fmt.Sprintf("/api/token/%d/reset", token.Id)
+				body := strings.Replace(resetBody, `"remain_quota":100`, fmt.Sprintf(`"remain_quota":%d`, testCase.quota), 1)
+				if testCase.unlimited {
+					assert.Equal(t, 409, request(path, rootPAT, body).Code)
+					body = strings.Replace(body, `"reset_at":200`, `"reset_at":200,"unlimited_quota":false`, 1)
+				}
+				require.Equal(t, 200, request(path, rootPAT, body).Code)
+				require.NoError(t, model.DB.First(token, token.Id).Error)
+				assert.Equal(t, testCase.expected, token.Status)
+				assert.Equal(t, testCase.quota, token.RemainQuota)
+				assert.Zero(t, token.UsedQuota)
+				assert.False(t, token.UnlimitedQuota)
+			})
+		}
+	})
+	t.Run("cache failure and batch accounting fail closed", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		path := fmt.Sprintf("/api/token/%d", token.Id)
+		previousRedis, previousClient := common.RedisEnabled, common.RDB
+		t.Cleanup(func() { common.RedisEnabled, common.RDB = previousRedis, previousClient })
+		server := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+		t.Cleanup(func() { _ = client.Close() })
+		common.RedisEnabled, common.RDB = true, client
+		_, err := model.GetTokenByKey(token.Key, true)
+		require.NoError(t, err)
+		require.NoError(t, token.ResetQuota(100, "cached", 100, 200, false, nil, nil))
+		server.FastForward(11 * time.Second)
+		cached, err := model.GetTokenByKey(token.Key, false)
+		require.NoError(t, err)
+		assert.Equal(t, 100, cached.RemainQuota)
+		cached, err = model.GetTokenByKey(token.Key, false)
+		require.NoError(t, err)
+		assert.EqualValues(t, 200, cached.QuotaResetAt)
+		assert.Equal(t, 100, cached.ConfiguredQuotaLimit())
+		require.NoError(t, client.Close())
+		assert.ErrorIs(t, token.ResetQuota(100, "unavailable", 200, 300, false, nil, nil), model.ErrQuotaCycleUnavailable)
+		assert.ErrorIs(t, token.SyncQuotaCycle(400, nil), model.ErrQuotaCycleUnavailable)
+		common.RedisEnabled = false
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, "cached", token.QuotaResetID)
+		assert.EqualValues(t, 200, token.QuotaResetAt)
+		common.BatchUpdateEnabled = true
+		response := request(path+"/reset", rootPAT, `{"remain_quota":100,"reset_id":"batch","cycle_started_at":200,"reset_at":300}`)
+		common.BatchUpdateEnabled = false
+		assert.Equal(t, 503, response.Code)
+	})
+	t.Run("transaction failure rolls back receipt and balance", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("quota-cycle:fail", func(tx *gorm.DB) {
+			if tx.Statement.Table == "tokens" {
+				_ = tx.AddError(errors.New("injected-storage-secret"))
+			}
+		}))
+		response := request(fmt.Sprintf("/api/token/%d/reset", token.Id), rootPAT, resetBody)
+		require.NoError(t, model.DB.Callback().Update().Remove("quota-cycle:fail"))
+		assert.Equal(t, 503, response.Code)
+		assert.NotContains(t, response.Body.String(), "injected-storage-secret")
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, 20, token.RemainQuota)
+		var receipts int64
+		require.NoError(t, model.DB.Model(&model.TokenQuotaReset{}).Where("token_id = ?", token.Id).Count(&receipts).Error)
+		assert.Zero(t, receipts)
+		require.Equal(t, 200, request(fmt.Sprintf("/api/token/%d/reset", token.Id), rootPAT, resetBody).Code)
+	})
+	t.Run("concurrent duplicate grants once", func(t *testing.T) {
+		token := createToken(t, common.TokenStatusEnabled, -1, false)
+		var workers sync.WaitGroup
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		for range 2 {
+			workers.Go(func() {
+				<-start
+				copyToken := *token
+				results <- copyToken.ResetQuota(100, "parallel", 100, 200, false, nil, nil)
+			})
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		succeeded := false
+		for err := range results {
+			if err == nil {
+				succeeded = true
+			}
+		}
+		require.True(t, succeeded)
+		_, err := model.AdjustTokenQuotaForCycle(token.Id, token.Key, 20, "parallel")
+		require.NoError(t, err)
+		require.NoError(t, token.ResetQuota(100, "parallel", 100, 200, false, nil, nil))
+		assert.Equal(t, 80, token.RemainQuota)
+		assert.Equal(t, 20, token.UsedQuota)
+		var receipts int64
+		require.NoError(t, model.DB.Model(&model.TokenQuotaReset{}).Where("token_id = ?", token.Id).Count(&receipts).Error)
+		assert.EqualValues(t, 1, receipts)
+	})
 }
 
 func openTokenControllerTestDB(t *testing.T) *gorm.DB {

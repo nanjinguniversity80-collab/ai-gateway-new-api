@@ -41,6 +41,7 @@ return 1`
 
 const tokenQuotaReserveScript = `
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
+  or (redis.call('HGET', KEYS[1], 'QuotaResetID') or '') ~= ''
   or redis.call('HEXISTS', KEYS[1], 'RemainQuota') == 0
   or redis.call('HEXISTS', KEYS[1], 'UsedQuota') == 0 then
   return -1
@@ -56,6 +57,7 @@ return 1`
 
 const tokenQuotaDeltaScript = `
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
+  or (redis.call('HGET', KEYS[1], 'QuotaResetID') or '') ~= ''
   or redis.call('HEXISTS', KEYS[1], 'RemainQuota') == 0
   or redis.call('HEXISTS', KEYS[1], 'UsedQuota') == 0 then
   return -1
@@ -125,7 +127,7 @@ func persistTokenQuotaDelta(id int, delta int) error {
 		addNewRecord(BatchUpdateTypeTokenQuota, id, delta)
 		return nil
 	}
-	result := DB.Model(&Token{}).Where("id = ?", id).Updates(
+	result := DB.Model(&Token{}).Where("id = ? AND quota_reset_id = ?", id, "").Updates(
 		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota + ?", delta),
 			"used_quota":    gorm.Expr("used_quota - ?", delta),
@@ -150,7 +152,7 @@ func reserveUserQuotaDB(id int, quota int) (bool, error) {
 
 func reserveTokenQuotaDB(id int, quota int) (bool, error) {
 	result := DB.Model(&Token{}).
-		Where("id = ? AND remain_quota >= ?", id, quota).
+		Where("id = ? AND remain_quota >= ? AND quota_reset_id = ?", id, quota, "").
 		Updates(map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
@@ -237,4 +239,77 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		return false, err
 	}
 	return true, nil
+}
+
+type TokenQuotaReservation struct {
+	ResetID   string
+	Unlimited bool
+}
+
+func ReserveTokenQuotaCycle(id int, key string, quota int, expectedCycle *string) (TokenQuotaReservation, bool, error) {
+	if quota < 0 {
+		return TokenQuotaReservation{}, false, errors.New("quota cannot be negative")
+	}
+	return mutateTokenQuotaCycle(id, key, quota, expectedCycle, true)
+}
+
+func AdjustTokenQuotaForCycle(id int, key string, delta int, cycleID string) (bool, error) {
+	_, applied, err := mutateTokenQuotaCycle(id, key, delta, &cycleID, false)
+	return applied, err
+}
+
+func mutateTokenQuotaCycle(id int, key string, delta int, expectedCycle *string, reserve bool) (TokenQuotaReservation, bool, error) {
+	if delta < -common.MaxWalletQuota || delta > common.MaxWalletQuota {
+		return TokenQuotaReservation{}, false, errors.New("token quota adjustment exceeds bounds")
+	}
+	var reservation TokenQuotaReservation
+	applied := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var token Token
+		if err := lockForUpdate(tx).Where("id = ?", id).First(&token).Error; err != nil {
+			return err
+		}
+		cycleID := token.QuotaResetID
+		reservation = TokenQuotaReservation{ResetID: cycleID, Unlimited: token.UnlimitedQuota}
+		if expectedCycle != nil && *expectedCycle != cycleID {
+			if reserve {
+				return ErrQuotaCycleStale
+			}
+			return nil
+		}
+		if token.UnlimitedQuota {
+			applied = reserve
+			return nil
+		}
+		if reserve && token.RemainQuota < delta {
+			return nil
+		}
+		if delta == 0 {
+			applied = true
+			return nil
+		}
+		if err := invalidateTokenCacheForMutation(token.Key); err != nil {
+			return ErrQuotaCycleUnavailable
+		}
+		result := tx.Model(&Token{}).Where("id = ? AND quota_reset_id = ?", id, cycleID).Updates(map[string]any{
+			"remain_quota":  gorm.Expr("remain_quota - ?", delta),
+			"used_quota":    gorm.Expr("used_quota + ?", delta),
+			"accessed_time": common.GetTimestamp(),
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		applied = result.RowsAffected == 1
+		key = token.Key
+		return nil
+	})
+	if err != nil {
+		return reservation, false, err
+	}
+	if applied && delta != 0 && !reservation.Unlimited {
+		if err := invalidateTokenCacheForMutation(key); err != nil {
+			common.SysError("failed to invalidate token cache after cycle accounting")
+		}
+	}
+	return reservation, applied, nil
 }

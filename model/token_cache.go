@@ -58,6 +58,10 @@ func cacheInitToken(token Token) (int, error) {
 		return 0, nil
 	}
 	allowIps := ""
+	quotaLimit := ""
+	if token.QuotaLimit != nil {
+		quotaLimit = strconv.Itoa(*token.QuotaLimit)
+	}
 	if token.AllowIps != nil {
 		allowIps = *token.AllowIps
 	}
@@ -74,7 +78,9 @@ redis.call('HSET', KEYS[1],
   'CreatedTime', ARGV[5], 'AccessedTime', ARGV[6], 'ExpiredTime', ARGV[7],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
-  'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16])
+  'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16],
+  'QuotaLimit', ARGV[18], 'QuotaResetID', ARGV[19],
+  'QuotaCycleStartedAt', ARGV[20], 'QuotaResetAt', ARGV[21], 'QuotaAutoRestore', ARGV[22])
 redis.call('EXPIRE', KEYS[1], ARGV[17])
 return 1`
 
@@ -87,6 +93,8 @@ return 1`
 		token.ModelLimits, allowIps, token.Group, strconv.FormatBool(token.CrossGroupRetry),
 		token.AutoGroups, token.RemainQuota, token.UsedQuota,
 		tokenCacheTTLSeconds(),
+		quotaLimit, token.QuotaResetID, token.QuotaCycleStartedAt, token.QuotaResetAt,
+		strconv.FormatBool(token.QuotaAutoRestore),
 	).Int()
 }
 
