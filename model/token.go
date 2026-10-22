@@ -429,6 +429,80 @@ func (token *Token) ResetQuota(quota int, resetID string, cycleStartedAt, resetA
 	return nil
 }
 
+// RestoreQuota restores the existing allowance while preserving all window fields,
+// including zero timestamps on legacy tokens. The receipt and balance share one
+// transaction; retries never clear usage accrued after the first application.
+func (token *Token) RestoreQuota(requestID, previousResetID string) error {
+	if len(requestID) == 0 || len(requestID) > 100 || len(previousResetID) > 128 {
+		return errors.New("invalid restore request")
+	}
+	for _, character := range requestID {
+		if character < 33 || character > 126 {
+			return errors.New("invalid restore request")
+		}
+	}
+	if common.BatchUpdateEnabled {
+		return ErrQuotaCycleUnavailable
+	}
+	resetID := "manual:" + requestID
+	receiptID := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d:%s", token.Id, resetID))))
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Token
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", token.Id, token.UserId).First(&current).Error; err != nil {
+			return err
+		}
+		*token = current
+		var previous TokenQuotaReset
+		err := tx.Where("id = ?", receiptID).First(&previous).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if current.UnlimitedQuota || current.QuotaResetID != previousResetID {
+			return ErrQuotaCycleConflict
+		}
+		quota := 0
+		if current.QuotaLimit != nil {
+			quota = *current.QuotaLimit
+		} else {
+			// Bound operands before addition so legacy data cannot overflow.
+			if current.RemainQuota < 0 || current.UsedQuota < 0 || current.RemainQuota > common.MaxWalletQuota || current.UsedQuota > common.MaxWalletQuota-current.RemainQuota {
+				return ErrQuotaCycleConflict
+			}
+			quota = current.RemainQuota + current.UsedQuota
+		}
+		if quota < 0 || quota > common.MaxWalletQuota {
+			return ErrQuotaCycleConflict
+		}
+		if err := invalidateTokenCacheForMutation(current.Key); err != nil {
+			return ErrQuotaCycleUnavailable
+		}
+		receipt := TokenQuotaReset{ID: receiptID, TokenID: current.Id, Quota: quota,
+			CycleStartedAt: current.QuotaCycleStartedAt, ResetAt: current.QuotaResetAt}
+		if err := tx.Create(&receipt).Error; err != nil {
+			return err
+		}
+		current.RemainQuota, current.UsedQuota, current.QuotaResetID = quota, 0, resetID
+		if current.Status == common.TokenStatusExhausted && quota > 0 && (current.ExpiredTime == -1 || current.ExpiredTime > common.GetTimestamp()) {
+			current.Status = common.TokenStatusEnabled
+		}
+		if err := tx.Model(&current).Select("remain_quota", "used_quota", "quota_reset_id", "status").Updates(&current).Error; err != nil {
+			return err
+		}
+		if err := invalidateTokenCacheForMutation(current.Key); err != nil {
+			return ErrQuotaCycleUnavailable
+		}
+		*token = current
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return invalidateTokenCacheForMutation(token.Key)
+}
+
 func (token *Token) SyncQuotaCycle(resetAt int64, autoRestore *bool) error {
 	if resetAt < 0 || resetAt > MaxQuotaCycleTimestamp {
 		return errors.New("invalid reset_at")

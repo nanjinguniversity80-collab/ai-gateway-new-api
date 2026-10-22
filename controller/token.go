@@ -561,6 +561,45 @@ func ResetTokenQuota(c *gin.Context) {
 	}{buildMaskedTokenResponse(token), request.ResetID, token.QuotaResetID != request.ResetID})
 }
 
+// RestoreTokenQuota never accepts calendar or allowance overrides.
+func RestoreTokenQuota(c *gin.Context) {
+	token := quotaCycleOwnedToken(c)
+	if token == nil {
+		return
+	}
+	var request struct {
+		RequestID       string  `json:"request_id"`
+		PreviousResetID *string `json:"previous_reset_id"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil || request.PreviousResetID == nil || len(*request.PreviousResetID) > 128 || len(request.RequestID) != 36 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid restore request"})
+		return
+	}
+	for index, character := range request.RequestID {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			if character == '-' {
+				continue
+			}
+		} else if (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f') {
+			continue
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid request_id"})
+		return
+	}
+	params := tokenAuditParams(c)
+	params["id"], params["name"] = token.Id, token.Name
+	if err := token.RestoreQuota(request.RequestID, *request.PreviousResetID); err != nil {
+		quotaCycleError(c, err, token)
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	common.ApiSuccess(c, struct {
+		*tokenResponse
+		AcknowledgedRequestID string `json:"acknowledged_request_id"`
+		Superseded            bool   `json:"superseded"`
+	}{buildMaskedTokenResponse(token), request.RequestID, token.QuotaResetID != "manual:"+request.RequestID})
+}
+
 func quotaCycleOwnedToken(c *gin.Context) *model.Token {
 	c.Header("Cache-Control", "no-store")
 	if c.GetInt("role") != common.RoleRootUser || c.GetInt("id") <= 0 {

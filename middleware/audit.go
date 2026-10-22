@@ -224,6 +224,8 @@ func TokenOperationAudit() gin.HandlerFunc {
 			action, content = "token.delete_batch", "API token batch deletion"
 		case "POST /api/token/:id/key":
 			action, content = "token.key_view", "API token key access"
+		case "POST /api/token/:id/restore":
+			action, content = "token.quota_restore", "API token allowance manually restored; window unchanged"
 		case "POST /api/token/:id/reset":
 			action, content = "token.quota_reset", "API token quota reset"
 		case "POST /api/token/:id/quota-cycle":

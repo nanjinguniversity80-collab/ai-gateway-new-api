@@ -274,6 +274,7 @@ func SetApiRouter(router *gin.Engine) {
 			tokenRoute.GET("/auto-groups", controller.GetTokenAutoGroups)
 			tokenRoute.GET("/:id", controller.GetToken)
 			tokenRoute.POST("/:id/key", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.GetTokenKey)
+			tokenRoute.POST("/:id/restore", middleware.RootAuth(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.RestoreTokenQuota)
 			tokenRoute.POST("/:id/reset", middleware.RootAuth(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.ResetTokenQuota)
 			tokenRoute.POST("/:id/quota-cycle", middleware.RootAuth(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.SyncTokenQuotaCycle)
 			tokenRoute.POST("/", controller.AddToken)
